@@ -24,7 +24,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from agent_client import send_command
-from config import Config, VMConfig, load_config
+from config import VMConfig, load_config
 
 load_dotenv()
 
@@ -116,21 +116,21 @@ def make_status_embed(data: dict, vm: VMConfig, slot_label: str = "") -> discord
     embed   = discord.Embed(title=title, colour=colour,
                             description=f"<t:{int(time.time())}:T>")
 
-    def f(name: str, value: str) -> None:
+    def add_field(name: str, value: str) -> None:
         embed.add_field(name=name, value=value or "—", inline=True)
 
-    f("VM",     f"{data.get('vm_id', vm.name)}[{data.get('bot_id', 0)}]")
-    f("Zone",   str(data.get("zone",  "Unknown")))
-    f("Level",  str(data.get("level", "?")))
-    f("Mode",   str(data.get("mode",  "unknown")))
-    f("Status", "🟢 Running" if running else "🔴 Stopped")
-    bag = data.get("bagFull", data.get("bagFillPct", 0))
-    f("Bags",   f"{bag:.0f}%")
+    add_field("VM",     f"{data.get('vm_id', vm.name)}[{data.get('bot_id', 0)}]")
+    add_field("Zone",   str(data.get("zone",  "Unknown")))
+    add_field("Level",  str(data.get("level", "?")))
+    add_field("Mode",   str(data.get("mode",  "unknown")))
+    add_field("Status", "🟢 Running" if running else "🔴 Stopped")
+    bag = data.get("bagFillPct", data.get("bagFull", 0))
+    add_field("Bags",   f"{bag:.0f}%")
 
     for key in ("xp", "hp", "mana"):
         val = data.get(key)
         if val is not None:
-            f(key.upper(), str(val))
+            add_field(key.upper(), str(val))
 
     err = data.get("error")
     if err and err != "status_unavailable":
@@ -252,58 +252,42 @@ async def cmd_vms(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed)
 
 
+# ── Simple command factory ─────────────────────────────────────────────────────
+# Commands that need only optional `vm` / `bot_slot` parameters are registered
+# via _simple() to avoid repeating the same decorator stack 11 times.
+
+def _simple(name: str, description: str, cmd_key: str, *, vm_only: bool = False) -> None:
+    """Register a slash command that forwards *cmd_key* with no extra arguments."""
+    if vm_only:
+        @bot.tree.command(name=name, description=description)
+        @app_commands.describe(vm="Target VM (default: first configured VM)")
+        @app_commands.autocomplete(vm=_vm_ac)
+        async def _handler_vm_only(
+            interaction: discord.Interaction,
+            vm: Optional[str] = None,
+        ) -> None:
+            await _send(interaction, vm, cmd_key)
+    else:
+        @bot.tree.command(name=name, description=description)
+        @app_commands.describe(
+            vm="Target VM (default: first configured VM)",
+            bot_slot="Bot slot 0–7, or 'all'",
+        )
+        @app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
+        async def _handler_with_bot_slot(
+            interaction: discord.Interaction,
+            vm: Optional[str] = None,
+            bot_slot: Optional[str] = None,
+        ) -> None:
+            await _send(interaction, vm, cmd_key, bot_target=bot_slot)
+
+
 # ── Bot control ────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="start", description="Start the bot")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all' (default: slot 0 / all depending on VM config)",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_start(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "START", bot_target=bot_slot)
-
-
-@bot.tree.command(name="stop", description="Stop the bot")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_stop(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "STOP", bot_target=bot_slot)
-
-
-@bot.tree.command(name="status", description="Show current bot status")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_status(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "STATUS", bot_target=bot_slot)
-
-
-@bot.tree.command(name="list", description="List all bot slots and their statuses on a VM")
-@app_commands.describe(vm="Target VM (default: first configured VM)")
-@app_commands.autocomplete(vm=_vm_ac)
-async def cmd_list(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "LIST")
+_simple("start",  "Start the bot",            "START")
+_simple("stop",   "Stop the bot",             "STOP")
+_simple("status", "Show current bot status",  "STATUS")
+_simple("list",   "List all bot slots and their statuses on a VM", "LIST", vm_only=True)
 
 
 # ── Mode & profiles ────────────────────────────────────────────────────────────
@@ -345,18 +329,7 @@ async def cmd_profile(
     await _send(interaction, vm, "PROFILE", args=name, bot_target=bot_slot)
 
 
-@bot.tree.command(name="profiles", description="List all available leveling profiles")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_profiles(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "PROFILES", bot_target=bot_slot)
+_simple("profiles", "List all available leveling profiles", "PROFILES")
 
 
 # ── Chat / social ──────────────────────────────────────────────────────────────
@@ -429,90 +402,16 @@ async def cmd_print(
 
 # ── Player actions ─────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="mail", description="Trigger auto-mail (send items to mailbox character)")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_mail(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "MAIL", bot_target=bot_slot)
-
-
-@bot.tree.command(name="jump", description="Make the character jump")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_jump(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "JUMP", bot_target=bot_slot)
-
-
-@bot.tree.command(name="sit", description="Make the character sit down")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_sit(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "SIT", bot_target=bot_slot)
-
-
-@bot.tree.command(name="stand", description="Make the character stand up")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_stand(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "STAND", bot_target=bot_slot)
+_simple("mail",       "Trigger auto-mail (send items to mailbox character)", "MAIL")
+_simple("jump",       "Make the character jump",                             "JUMP")
+_simple("sit",        "Make the character sit down",                         "SIT")
+_simple("stand",      "Make the character stand up",                         "STAND")
 
 
 # ── System ─────────────────────────────────────────────────────────────────────
 
-@bot.tree.command(name="reload", description="Reload the WoW UI (ReloadUI)")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_reload(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "RELOAD", bot_target=bot_slot)
-
-
-@bot.tree.command(name="disconnect", description="Disconnect the character from the game (/quit)")
-@app_commands.describe(
-    vm="Target VM (default: first configured VM)",
-    bot_slot="Bot slot 0–7, or 'all'",
-)
-@app_commands.autocomplete(vm=_vm_ac, bot_slot=_bot_ac)
-async def cmd_disconnect(
-    interaction: discord.Interaction,
-    vm: Optional[str] = None,
-    bot_slot: Optional[str] = None,
-) -> None:
-    await _send(interaction, vm, "DISCONNECT", bot_target=bot_slot)
+_simple("reload",     "Reload the WoW UI (ReloadUI)",                        "RELOAD")
+_simple("disconnect", "Disconnect the character from the game (/quit)",       "DISCONNECT")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
