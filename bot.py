@@ -13,10 +13,15 @@ Environment variables — see .env.example for details.
 """
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
+import pathlib
 import sys
 import time
 from typing import Optional
+
+from PIL import Image, ImageDraw, ImageFont
 
 import discord
 from discord import app_commands
@@ -36,6 +41,18 @@ logging.basicConfig(
 log = logging.getLogger("gromitbot-discord")
 
 cfg = load_config()
+
+# Path to the world-map image bundled with the bot
+MAP_IMAGE_PATH = pathlib.Path(__file__).parent / "Flightpathanddetailsworld.webp"
+
+# Purple dot used on the /map overlay
+_DOT_COLOUR     = (148, 0, 211, 230)   # purple, slightly transparent fill
+_DOT_OUTLINE    = ( 80, 0, 140, 255)   # darker purple outline
+_DOT_RADIUS     = 12                   # pixels (at full 5000×3730 resolution)
+_LABEL_COLOUR   = (255, 255, 255)      # white label text
+_LABEL_OFFSET_X = 3                    # pixels right of the dot edge
+_LABEL_OFFSET_Y = -7                   # pixels up from the dot centre
+_MAP_OUTPUT_W   = 2500                 # resize output to this width to keep Discord upload small
 
 
 # ── Custom CommandTree (channel restriction + centralised error handling) ──────
@@ -412,6 +429,109 @@ _simple("stand",      "Make the character stand up",                         "ST
 
 _simple("reload",     "Reload the WoW UI (ReloadUI)",                        "RELOAD")
 _simple("disconnect", "Disconnect the character from the game (/quit)",       "DISCONNECT")
+
+
+# ── /map — world-map overlay ───────────────────────────────────────────────────
+
+@bot.tree.command(
+    name="map",
+    description="Show all bot locations as purple dots on the world map",
+)
+async def cmd_map(interaction: discord.Interaction) -> None:
+    """Query every configured VM for all bot positions and render them on the world map."""
+    await interaction.response.defer()
+
+    # ── 1. Load the world-map image ──────────────────────────────────────────
+    if not MAP_IMAGE_PATH.exists():
+        await interaction.followup.send(
+            f"❌ World-map image not found at `{MAP_IMAGE_PATH}`."
+        )
+        return
+
+    try:
+        base_img = Image.open(MAP_IMAGE_PATH).convert("RGBA")
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Could not open map image: `{exc}`")
+        return
+
+    img_w, img_h = base_img.size
+
+    # ── 2. Query all VMs for all bot positions in parallel ───────────────────
+    payloads = [build_payload("POSITION", bot_target="all") for _ in cfg.vms]
+    responses: list = await asyncio.gather(
+        *[send_command(vm, pl) for vm, pl in zip(cfg.vms, payloads)],
+        return_exceptions=True,
+    )
+
+    # ── 3. Collect positions ─────────────────────────────────────────────────
+    draw = ImageDraw.Draw(base_img)
+    r    = _DOT_RADIUS
+    dot_count = 0
+
+    for vm, result in zip(cfg.vms, responses):
+        if isinstance(result, Exception):
+            log.warning("Exception querying %s for POSITION: %s", vm.name, result)
+            continue
+        if not result.get("ok"):
+            log.info("POSITION failed for %s: %s", vm.name, result.get("error"))
+            continue
+
+        data = result.get("data")
+        if not isinstance(data, dict):
+            continue
+
+        # Agent may return a single-bot dict  OR  {"bots": [...]}
+        bots: list[dict] = data.get("bots") if "bots" in data else [data]
+
+        for bot_data in bots:
+            map_x = bot_data.get("mapX")
+            map_y = bot_data.get("mapY")
+            if map_x is None or map_y is None:
+                continue
+
+            # Clamp to [0, 1] to guard against out-of-range values
+            map_x = max(0.0, min(1.0, float(map_x)))
+            map_y = max(0.0, min(1.0, float(map_y)))
+
+            px = int(map_x * img_w)
+            py = int(map_y * img_h)
+
+            # Draw filled purple circle with outline
+            draw.ellipse(
+                [px - r, py - r, px + r, py + r],
+                fill=_DOT_COLOUR,
+                outline=_DOT_OUTLINE,
+                width=2,
+            )
+
+            # Label: character name or fallback to vm[slot]
+            label = bot_data.get("name") or f"{vm.name}[{bot_data.get('bot_id', '?')}]"
+            draw.text((px + r + _LABEL_OFFSET_X, py + _LABEL_OFFSET_Y), label, fill=_LABEL_COLOUR)
+
+            dot_count += 1
+
+    # ── 4. Resize to reduce upload size ─────────────────────────────────────
+    scale  = _MAP_OUTPUT_W / img_w
+    out_h  = int(img_h * scale)
+    resized = base_img.resize((_MAP_OUTPUT_W, out_h), Image.LANCZOS)
+
+    # ── 5. Encode and send ───────────────────────────────────────────────────
+    buf = io.BytesIO()
+    resized.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+    buf.seek(0)
+
+    if dot_count == 0:
+        content = (
+            "🗺️ **GromitBot World Map** — ⚠️ No bot positions reported.\n"
+            "Make sure agents are running and returning `mapX`/`mapY` in their `POSITION` response."
+        )
+    else:
+        content = f"🗺️ **GromitBot World Map** — {dot_count} bot(s) shown"
+
+    await interaction.followup.send(
+        content=content,
+        file=discord.File(buf, filename="gromitbot_map.jpg"),
+    )
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
